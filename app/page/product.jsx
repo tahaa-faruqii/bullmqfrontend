@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useRef, useState } from "react";
 import {
+  BULK_UPLOAD_CHUNK_SIZE,
   getApiErrorMessage,
   useBulkCreateProductsMutation,
   useBulkDeleteProductsMutation,
@@ -33,8 +34,12 @@ function formatPrice(value) {
 }
 
 export default function ProductPage() {
-  const { data: products = [], isLoading: loading, error: productsError } =
-    useGetProductsQuery();
+  const {
+    data: products = [],
+    isLoading: loading,
+    error: productsError,
+  } = useGetProductsQuery();
+  const productTotal = products.length;
   const [createProduct, { isLoading: isCreating }] = useCreateProductMutation();
   const [updateProduct, { isLoading: isUpdating }] =
     useUpdateProductMutation();
@@ -189,11 +194,35 @@ export default function ProductPage() {
       }
 
       setBulkPhase("uploading");
-      setBulkProgress({ done: prepared.length, total: prepared.length, failed: 0 });
+      setBulkProgress({ done: 0, total: prepared.length, failed: 0 });
 
-      const result = await bulkCreateProducts(prepared).unwrap();
-      const created = result.created?.length ?? 0;
-      const failed = result.failed?.length ?? 0;
+      let totalCreated = 0;
+      let totalFailed = 0;
+
+      for (let i = 0; i < prepared.length; i += BULK_UPLOAD_CHUNK_SIZE) {
+        const chunk = prepared.slice(i, i + BULK_UPLOAD_CHUNK_SIZE);
+        const chunkEnd = Math.min(i + BULK_UPLOAD_CHUNK_SIZE, prepared.length);
+
+        setBulkProgress({
+          done: i,
+          total: prepared.length,
+          failed: totalFailed,
+        });
+
+        const result = await bulkCreateProducts(chunk).unwrap();
+        totalCreated +=
+          result.createdCount ?? result.created?.length ?? 0;
+        totalFailed += result.failed?.length ?? 0;
+
+        setBulkProgress({
+          done: chunkEnd,
+          total: prepared.length,
+          failed: totalFailed,
+        });
+      }
+
+      const created = totalCreated;
+      const failed = totalFailed;
 
       setBulkProgress({ done: prepared.length, total: prepared.length, failed });
       setBulkMessage(
@@ -216,10 +245,10 @@ export default function ProductPage() {
 
   
   async function handleBulkDelete() {
-    if (products.length === 0) return;
+    if (productTotal === 0) return;
     if (
       !window.confirm(
-        `Delete all ${products.length} product${products.length === 1 ? "" : "s"}? This cannot be undone.`,
+        `Delete all ${productTotal} product${productTotal === 1 ? "" : "s"}? This cannot be undone.`,
       )
     ) {
       return;
@@ -258,13 +287,13 @@ export default function ProductPage() {
             <button
               type="button"
               onClick={handleBulkDelete}
-              disabled={bulkDeleting || loading || products.length === 0}
+              disabled={bulkDeleting || loading || productTotal === 0}
               className="rounded-lg border border-red-200 bg-red-50 px-4 py-2.5 text-sm font-medium text-red-700 transition hover:bg-red-100 disabled:opacity-50 dark:border-red-900 dark:bg-red-950/40 dark:text-red-400 dark:hover:bg-red-950/60"
             >
               {bulkDeleting ? "Deleting…" : "Delete all products"}
             </button>
             <p className="text-sm text-zinc-500">
-              {products.length} product{products.length === 1 ? "" : "s"}
+              {productTotal} product{productTotal === 1 ? "" : "s"}
             </p>
           </div>
         </header>
@@ -410,6 +439,8 @@ JSON:
                     {bulkPhase === "preparing" &&
                       `Loading data… ${bulkProgress.done}/${bulkProgress.total}`}
                     {bulkPhase === "uploading" && "All data ready — sending to API…"}
+                    {bulkPhase === "processing" &&
+                      `Creating products… ${bulkProgress.done}/${bulkProgress.total}`}
                   </span>
                   {bulkProgress.total > 0 && bulkPhase !== "reading" && (
                     <span>
@@ -427,7 +458,8 @@ JSON:
                       bulkPhase === "uploading" ? "w-full animate-pulse" : ""
                     }`}
                     style={
-                      bulkPhase === "preparing" && bulkProgress.total > 0
+                      (bulkPhase === "preparing" || bulkPhase === "processing") &&
+                      bulkProgress.total > 0
                         ? {
                             width: `${(bulkProgress.done / bulkProgress.total) * 100}%`,
                           }
@@ -451,7 +483,7 @@ JSON:
               type="button"
               onClick={handleBulkDelete}
               disabled={
-                bulkDeleting || bulkImporting || loading || products.length === 0
+                bulkDeleting || bulkImporting || loading || productTotal === 0
               }
               className="mt-3 w-full rounded-lg border border-red-200 bg-red-50 px-4 py-2.5 text-sm font-medium text-red-700 transition hover:bg-red-100 disabled:opacity-50 dark:border-red-900 dark:bg-red-950/40 dark:text-red-400 dark:hover:bg-red-950/60"
             >
