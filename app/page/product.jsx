@@ -2,9 +2,12 @@
 
 import Link from "next/link";
 import { useRef, useState } from "react";
+import { useDispatch } from "react-redux";
 import {
   BULK_UPLOAD_CHUNK_SIZE,
   getApiErrorMessage,
+  pollBulkJob,
+  productsApi,
   useBulkCreateProductsMutation,
   useBulkDeleteProductsMutation,
   useCreateProductMutation,
@@ -17,7 +20,6 @@ import {
   formatFileSize,
   MAX_BULK_FILE_BYTES,
   MAX_BULK_FILE_GB,
-  MAX_BULK_PRODUCTS,
 } from "@/lib/limits";
 
 const emptyForm = {
@@ -34,6 +36,7 @@ function formatPrice(value) {
 }
 
 export default function ProductPage() {
+  const dispatch = useDispatch();
   const {
     data: products = [],
     isLoading: loading,
@@ -41,8 +44,7 @@ export default function ProductPage() {
   } = useGetProductsQuery();
   const productTotal = products.length;
   const [createProduct, { isLoading: isCreating }] = useCreateProductMutation();
-  const [updateProduct, { isLoading: isUpdating }] =
-    useUpdateProductMutation();
+  const [updateProduct, { isLoading: isUpdating }] = useUpdateProductMutation();
   const [deleteProduct] = useDeleteProductMutation();
   const [bulkCreateProducts] = useBulkCreateProductsMutation();
   const [bulkDeleteProducts, { isLoading: bulkDeleting }] =
@@ -56,7 +58,11 @@ export default function ProductPage() {
   const [bulkFileName, setBulkFileName] = useState("");
   const [bulkImporting, setBulkImporting] = useState(false);
   const [bulkPhase, setBulkPhase] = useState("idle");
-  const [bulkProgress, setBulkProgress] = useState({ done: 0, total: 0, failed: 0 });
+  const [bulkProgress, setBulkProgress] = useState({
+    done: 0,
+    total: 0,
+    failed: 0,
+  });
   const [bulkError, setBulkError] = useState("");
   const [bulkMessage, setBulkMessage] = useState("");
   const bulkImportLockRef = useRef(false);
@@ -146,90 +152,90 @@ export default function ProductPage() {
       setBulkError("Choose a CSV or JSON file first.");
       return;
     }
+
     if (bulkImportLockRef.current) return;
 
     bulkImportLockRef.current = true;
     setBulkImporting(true);
     setBulkError("");
     setBulkMessage("");
+    setBulkPhase("reading");
     setBulkProgress({ done: 0, total: 0, failed: 0 });
 
     try {
-      setBulkPhase("reading");
       const text = await readFileAsText(bulkFile);
 
       setBulkPhase("preparing");
       const rawRows = getRawProductRows(text, bulkFile.name);
-      const total = rawRows.length;
+      const rowTotal = rawRows.length;
+      setBulkProgress({ done: 0, total: rowTotal, failed: 0 });
 
-      if (total === 0) {
-        setBulkError("No valid products found in file.");
-        return;
-      }
-      if (total > MAX_BULK_PRODUCTS) {
-        setBulkError(
-          `Too many products (${total}). Maximum ${MAX_BULK_PRODUCTS} per upload. Split your file and try again.`,
-        );
-        return;
-      }
-
-      const chunkSize = getPrepChunkSize(total);
       const prepared = [];
-
-      for (let i = 0; i < rawRows.length; i += chunkSize) {
-        const chunk = rawRows.slice(i, i + chunkSize);
-        prepared.push(...chunk.map(normalizeBulkRow).filter(isValidProductRow));
-
+      for (let i = 0; i < rawRows.length; i += BULK_UPLOAD_CHUNK_SIZE) {
+        const chunk = rawRows.slice(i, i + BULK_UPLOAD_CHUNK_SIZE);
+        for (const row of chunk) {
+          const normalized = normalizeBulkRow(row);
+          if (isValidProductRow(normalized)) prepared.push(normalized);
+        }
         setBulkProgress({
-          done: Math.min(i + chunkSize, total),
-          total,
+          done: Math.min(i + BULK_UPLOAD_CHUNK_SIZE, rowTotal),
+          total: rowTotal,
           failed: 0,
         });
-        await yieldToUi();
+        await new Promise((resolve) => setTimeout(resolve, 0));
       }
 
       if (prepared.length === 0) {
-        setBulkError("No valid products found in file.");
+        setBulkError("No valid products found.");
         return;
       }
 
+      // One HTTP POST → one BullMQ job (worker batches inserts internally)
       setBulkPhase("uploading");
-      setBulkProgress({ done: 0, total: prepared.length, failed: 0 });
+      setBulkProgress({
+        done: 0,
+        total: prepared.length,
+        failed: 0,
+      });
+
+      const queued = await bulkCreateProducts(prepared).unwrap();
+
+      const jobId = queued.jobId ?? queued.jobIds?.[0] ?? null;
 
       let totalCreated = 0;
-      let totalFailed = 0;
+      let allFailed = [];
 
-      for (let i = 0; i < prepared.length; i += BULK_UPLOAD_CHUNK_SIZE) {
-        const chunk = prepared.slice(i, i + BULK_UPLOAD_CHUNK_SIZE);
-        const chunkEnd = Math.min(i + BULK_UPLOAD_CHUNK_SIZE, prepared.length);
+      if (queued.status === "processing" && jobId) {
+        setBulkPhase("processing");
 
-        setBulkProgress({
-          done: i,
-          total: prepared.length,
-          failed: totalFailed,
+        const result = await pollBulkJob(jobId, (progress) => {
+          setBulkProgress({
+            done: Math.round((progress / 100) * prepared.length),
+            total: prepared.length,
+            failed: allFailed.length,
+          });
         });
 
-        const result = await bulkCreateProducts(chunk).unwrap();
-        totalCreated +=
-          result.createdCount ?? result.created?.length ?? 0;
-        totalFailed += result.failed?.length ?? 0;
-
-        setBulkProgress({
-          done: chunkEnd,
-          total: prepared.length,
-          failed: totalFailed,
-        });
+        totalCreated = result.createdCount ?? 0;
+        if (Array.isArray(result.failed)) allFailed = result.failed;
+      } else {
+        totalCreated =
+          queued.createdCount ?? queued.created?.length ?? prepared.length;
+        if (Array.isArray(queued.failed)) allFailed = queued.failed;
       }
 
-      const created = totalCreated;
-      const failed = totalFailed;
+      setBulkProgress({
+        done: prepared.length,
+        total: prepared.length,
+        failed: allFailed.length,
+      });
 
-      setBulkProgress({ done: prepared.length, total: prepared.length, failed });
       setBulkMessage(
-        failed === 0
-          ? `${created} product${created === 1 ? "" : "s"} created successfully.`
-          : `${created} created, ${failed} failed.`,
+        allFailed.length === 0
+          ? `${totalCreated} product${totalCreated === 1 ? "" : "s"} created successfully.`
+          : `${totalCreated} created, ${allFailed.length} failed.`,
       );
+
       setBulkFile(null);
       setBulkFileName("");
       setBulkPhase("idle");
@@ -242,8 +248,6 @@ export default function ProductPage() {
     }
   }
 
-
-  
   async function handleBulkDelete() {
     if (productTotal === 0) return;
     if (
@@ -258,9 +262,23 @@ export default function ProductPage() {
     setBulkMessage("");
 
     try {
-      const result = await bulkDeleteProducts().unwrap();
-      if (editingId) resetForm();
-      setBulkMessage(result.message ?? "All products deleted.");
+      const queued = await bulkDeleteProducts().unwrap();
+
+      if (queued.jobId) {
+        const result = await pollBulkJob(queued.jobId);
+        const count = result.deletedCount ?? productTotal;
+        if (editingId) resetForm();
+        dispatch(
+          productsApi.util.updateQueryData("getProducts", undefined, () => []),
+        );
+        setBulkMessage(`${count} product${count === 1 ? "" : "s"} deleted.`);
+      } else {
+        if (editingId) resetForm();
+        dispatch(
+          productsApi.util.updateQueryData("getProducts", undefined, () => []),
+        );
+        setBulkMessage(queued.message ?? "All products deleted.");
+      }
     } catch (err) {
       setBulkError(getApiErrorMessage(err, "Bulk delete failed"));
     }
@@ -300,115 +318,117 @@ export default function ProductPage() {
 
         <div className="flex flex-col gap-8">
           <div className="grid gap-8 md:grid-cols-2">
-          <section className="rounded-2xl border border-zinc-200 bg-white p-6 shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
-            <h2 className="text-lg font-medium">
-              {editingId ? "Edit product" : "Add product"}
-            </h2>
-            <form onSubmit={handleSubmit} className="mt-5 space-y-4">
-              <Field label="Name" required>
-                <input
-                  name="name"
-                  value={form.name}
-                  onChange={handleChange}
-                  required
-                  className={inputClass}
-                  placeholder="Product name"
-                />
-              </Field>
-              <Field label="Description" required>
-                <textarea
-                  name="description"
-                  value={form.description}
-                  onChange={handleChange}
-                  rows={3}
-                  required
-                  className={inputClass}
-                  placeholder="Short description"
-                />
-              </Field>
-              <Field label="Price ($)" required>
-                <input
-                  name="price"
-                  type="number"
-                  min="0"
-                  step="0.01"
-                  value={form.price}
-                  onChange={handleChange}
-                  required
-                  className={inputClass}
-                  placeholder="0.00"
-                />
-              </Field>
+            <section className="rounded-2xl border border-zinc-200 bg-white p-6 shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
+              <h2 className="text-lg font-medium">
+                {editingId ? "Edit product" : "Add product"}
+              </h2>
+              <form onSubmit={handleSubmit} className="mt-5 space-y-4">
+                <Field label="Name" required>
+                  <input
+                    name="name"
+                    value={form.name}
+                    onChange={handleChange}
+                    required
+                    className={inputClass}
+                    placeholder="Product name"
+                  />
+                </Field>
+                <Field label="Description" required>
+                  <textarea
+                    name="description"
+                    value={form.description}
+                    onChange={handleChange}
+                    rows={3}
+                    required
+                    className={inputClass}
+                    placeholder="Short description"
+                  />
+                </Field>
+                <Field label="Price ($)" required>
+                  <input
+                    name="price"
+                    type="number"
+                    min="0"
+                    step="0.01"
+                    value={form.price}
+                    onChange={handleChange}
+                    required
+                    className={inputClass}
+                    placeholder="0.00"
+                  />
+                </Field>
 
-              {error && (
-                <p className="rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700 dark:bg-red-950/50 dark:text-red-300">
-                  {error}
+                {error && (
+                  <p className="rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700 dark:bg-red-950/50 dark:text-red-300">
+                    {error}
+                  </p>
+                )}
+
+                <div className="flex gap-3 pt-1">
+                  <button
+                    type="submit"
+                    disabled={saving}
+                    className="flex-1 rounded-lg bg-zinc-900 px-4 py-2.5 text-sm font-medium text-white transition hover:bg-zinc-700 disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300"
+                  >
+                    {saving
+                      ? "Saving…"
+                      : editingId
+                        ? "Update product"
+                        : "Add product"}
+                  </button>
+                  {editingId && (
+                    <button
+                      type="button"
+                      onClick={resetForm}
+                      className="rounded-lg border border-zinc-300 px-4 py-2.5 text-sm font-medium transition hover:bg-zinc-100 dark:border-zinc-600 dark:hover:bg-zinc-800"
+                    >
+                      Cancel
+                    </button>
+                  )}
+                </div>
+              </form>
+            </section>
+
+            <section className="rounded-2xl border border-zinc-200 bg-white p-6 shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
+              <h2 className="text-lg font-medium">Bulk upload</h2>
+              <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">
+                Upload CSV or JSON. Click Done to import all products in one
+                request.
+              </p>
+              <p className="mt-2 text-xs text-zinc-500">{BULK_LIMITS_HINT}</p>
+
+              <label className="mt-5 flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed border-zinc-300 px-4 py-8 transition hover:border-zinc-400 hover:bg-zinc-50 dark:border-zinc-600 dark:hover:border-zinc-500 dark:hover:bg-zinc-800/50">
+                <span className="text-sm font-medium text-zinc-700 dark:text-zinc-300">
+                  Choose file
+                </span>
+                <span className="mt-1 text-xs text-zinc-500">
+                  .csv or .json
+                </span>
+                <input
+                  type="file"
+                  accept=".csv,.json,application/json,text/csv"
+                  onChange={handleBulkFileChange}
+                  disabled={bulkImporting}
+                  className="sr-only"
+                />
+              </label>
+
+              {bulkFileName && (
+                <p className="mt-3 truncate text-sm text-zinc-600 dark:text-zinc-400">
+                  <span className="font-medium text-zinc-800 dark:text-zinc-200">
+                    {bulkFileName}
+                  </span>
+                  {" · "}
+                  ready — click Done to load and upload
                 </p>
               )}
 
-              <div className="flex gap-3 pt-1">
-                <button
-                  type="submit"
-                  disabled={saving}
-                  className="flex-1 rounded-lg bg-zinc-900 px-4 py-2.5 text-sm font-medium text-white transition hover:bg-zinc-700 disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300"
-                >
-                  {saving
-                    ? "Saving…"
-                    : editingId
-                      ? "Update product"
-                      : "Add product"}
-                </button>
-                {editingId && (
-                  <button
-                    type="button"
-                    onClick={resetForm}
-                    className="rounded-lg border border-zinc-300 px-4 py-2.5 text-sm font-medium transition hover:bg-zinc-100 dark:border-zinc-600 dark:hover:bg-zinc-800"
-                  >
-                    Cancel
-                  </button>
-                )}
-              </div>
-            </form>
-          </section>
-
-          <section className="rounded-2xl border border-zinc-200 bg-white p-6 shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
-            <h2 className="text-lg font-medium">Bulk upload</h2>
-            <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">
-              Upload CSV or JSON. Click Done to import all products in one
-              request.
-            </p>
-            <p className="mt-2 text-xs text-zinc-500">{BULK_LIMITS_HINT}</p>
-
-            <label className="mt-5 flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed border-zinc-300 px-4 py-8 transition hover:border-zinc-400 hover:bg-zinc-50 dark:border-zinc-600 dark:hover:border-zinc-500 dark:hover:bg-zinc-800/50">
-              <span className="text-sm font-medium text-zinc-700 dark:text-zinc-300">
-                Choose file
-              </span>
-              <span className="mt-1 text-xs text-zinc-500">.csv or .json</span>
-              <input
-                type="file"
-                accept=".csv,.json,application/json,text/csv"
-                onChange={handleBulkFileChange}
-                disabled={bulkImporting}
-                className="sr-only"
-              />
-            </label>
-
-            {bulkFileName && (
-              <p className="mt-3 truncate text-sm text-zinc-600 dark:text-zinc-400">
-                <span className="font-medium text-zinc-800 dark:text-zinc-200">
-                  {bulkFileName}
-                </span>
-                {" · "}
-                ready — click Done to load and upload
-              </p>
-            )}
-
-            <details className="mt-4 text-xs text-zinc-500">
-              <summary className="cursor-pointer font-medium text-zinc-600 dark:text-zinc-400">
-                File format
-              </summary>
-              <pre className="mt-2 overflow-x-auto rounded-lg bg-zinc-100 p-3 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300">
-                {`CSV:
+              <details className="mt-4 text-xs text-zinc-500">
+                <summary className="cursor-pointer font-medium text-zinc-600 dark:text-zinc-400">
+                  File format
+                </summary>
+                <pre className="mt-2 overflow-x-auto rounded-lg bg-zinc-100 p-3 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300">
+                  {`CSV:
 name,price,description
 Widget,19.99,Short desc
 
@@ -416,80 +436,83 @@ JSON:
 [
   { "name": "Widget", "price": 19.99, "description": "Short desc" }
 ]`}
-              </pre>
-            </details>
+                </pre>
+              </details>
 
-            {bulkError && (
-              <p className="mt-3 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700 dark:bg-red-950/50 dark:text-red-300">
-                {bulkError}
-              </p>
-            )}
+              {bulkError && (
+                <p className="mt-3 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700 dark:bg-red-950/50 dark:text-red-300">
+                  {bulkError}
+                </p>
+              )}
 
-            {bulkMessage && (
-              <p className="mt-3 rounded-lg bg-emerald-50 px-3 py-2 text-sm text-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-300">
-                {bulkMessage}
-              </p>
-            )}
+              {/* {bulkMessage && (
+                <p className="mt-3 rounded-lg bg-emerald-50 px-3 py-2 text-sm text-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-300">
+                  {bulkMessage}
+                </p>
+              )} */}
 
-            {bulkImporting && (
-              <div className="mt-4">
-                <div className="mb-1 flex justify-between text-xs text-zinc-500">
-                  <span>
-                    {bulkPhase === "reading" && "Reading file…"}
-                    {bulkPhase === "preparing" &&
-                      `Loading data… ${bulkProgress.done}/${bulkProgress.total}`}
-                    {bulkPhase === "uploading" && "All data ready — sending to API…"}
-                    {bulkPhase === "processing" &&
-                      `Creating products… ${bulkProgress.done}/${bulkProgress.total}`}
-                  </span>
-                  {bulkProgress.total > 0 && bulkPhase !== "reading" && (
+              {bulkImporting && (
+                <div className="mt-4">
+                  <div className="mb-1 flex justify-between text-xs text-zinc-500">
                     <span>
-                      {bulkPhase === "uploading"
-                        ? bulkProgress.total
-                        : `${bulkProgress.done}/${bulkProgress.total}`}
+                      {bulkPhase === "reading" && "Reading file…"}
+                      {bulkPhase === "preparing" &&
+                        `Loading data… ${bulkProgress.done}/${bulkProgress.total}`}
+                      {bulkPhase === "uploading" &&
+                        `Queuing batch… ${bulkProgress.done}/${bulkProgress.total}`}
+                      {bulkPhase === "processing" &&
+                        `Creating products… ${bulkProgress.done}/${bulkProgress.total}`}
                     </span>
-                  )}
+                    {bulkProgress.total > 0 && bulkPhase !== "reading" && (
+                      <span>
+                        {bulkPhase === "uploading"
+                          ? bulkProgress.total
+                          : `${bulkProgress.done}/${bulkProgress.total}`}
+                      </span>
+                    )}
+                  </div>
+                  <div className="h-2 overflow-hidden rounded-full bg-zinc-200 dark:bg-zinc-700">
+                    <div
+                      className={`h-full bg-zinc-900 transition-all dark:bg-zinc-100 ${
+                        bulkPhase === "reading" ? "w-1/4 animate-pulse" : ""
+                      } ${
+                        bulkPhase === "uploading" ? "w-full animate-pulse" : ""
+                      }`}
+                      style={
+                        (bulkPhase === "preparing" ||
+                          bulkPhase === "uploading" ||
+                          bulkPhase === "processing") &&
+                        bulkProgress.total > 0
+                          ? {
+                              width: `${(bulkProgress.done / bulkProgress.total) * 100}%`,
+                            }
+                          : undefined
+                      }
+                    />
+                  </div>
                 </div>
-                <div className="h-2 overflow-hidden rounded-full bg-zinc-200 dark:bg-zinc-700">
-                  <div
-                    className={`h-full bg-zinc-900 transition-all dark:bg-zinc-100 ${
-                      bulkPhase === "reading" ? "w-1/4 animate-pulse" : ""
-                    } ${
-                      bulkPhase === "uploading" ? "w-full animate-pulse" : ""
-                    }`}
-                    style={
-                      (bulkPhase === "preparing" || bulkPhase === "processing") &&
-                      bulkProgress.total > 0
-                        ? {
-                            width: `${(bulkProgress.done / bulkProgress.total) * 100}%`,
-                          }
-                        : undefined
-                    }
-                  />
-                </div>
-              </div>
-            )}
+              )}
 
-            <button
-              type="button"
-              onClick={handleBulkImport}
-              disabled={bulkImporting || bulkDeleting || !bulkFile}
-              className="mt-5 w-full rounded-lg bg-zinc-900 px-4 py-2.5 text-sm font-medium text-white transition hover:bg-zinc-700 disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300"
-            >
-              {bulkImporting ? "Importing…" : "Done — create all"}
-            </button>
+              <button
+                type="button"
+                onClick={handleBulkImport}
+                disabled={bulkImporting || bulkDeleting || !bulkFile}
+                className="mt-5 w-full rounded-lg bg-zinc-900 px-4 py-2.5 text-sm font-medium text-white transition hover:bg-zinc-700 disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300"
+              >
+                {bulkImporting ? "Importing…" : "Done — create all"}
+              </button>
 
-            <button
-              type="button"
-              onClick={handleBulkDelete}
-              disabled={
-                bulkDeleting || bulkImporting || loading || productTotal === 0
-              }
-              className="mt-3 w-full rounded-lg border border-red-200 bg-red-50 px-4 py-2.5 text-sm font-medium text-red-700 transition hover:bg-red-100 disabled:opacity-50 dark:border-red-900 dark:bg-red-950/40 dark:text-red-400 dark:hover:bg-red-950/60"
-            >
-              {bulkDeleting ? "Deleting all…" : "Delete all products"}
-            </button>
-          </section>
+              <button
+                type="button"
+                onClick={handleBulkDelete}
+                disabled={
+                  bulkDeleting || bulkImporting || loading || productTotal === 0
+                }
+                className="mt-3 w-full rounded-lg border border-red-200 bg-red-50 px-4 py-2.5 text-sm font-medium text-red-700 transition hover:bg-red-100 disabled:opacity-50 dark:border-red-900 dark:bg-red-950/40 dark:text-red-400 dark:hover:bg-red-950/60"
+              >
+                {bulkDeleting ? "Deleting all…" : "Delete all products"}
+              </button>
+            </section>
           </div>
 
           <section>
@@ -569,15 +592,6 @@ function readFileAsText(file) {
     reader.onerror = () => reject(new Error("Failed to read file."));
     reader.readAsText(file);
   });
-}
-
-function yieldToUi() {
-  return new Promise((resolve) => setTimeout(resolve, 0));
-}
-
-function getPrepChunkSize(total) {
-  if (total <= 1000) return 100;
-  return 1000;
 }
 
 function isValidProductRow(row) {
